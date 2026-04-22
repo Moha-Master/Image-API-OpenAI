@@ -5,7 +5,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from .config import Config
@@ -155,6 +155,8 @@ def _request_modelscope(payload: Dict[str, Any]) -> Dict[str, Any]:
             "X-ModelScope-Task-Type": config.MODELSCOPE_TASK_TYPE,
         }
         deadline = time.time() + config.REQUEST_TIMEOUT_SECONDS
+        polling_interval = 5  # 初始轮询间隔5秒
+        start_time = time.time()
         while time.time() < deadline:
             task_resp = requests.get(
                 task_url,
@@ -182,7 +184,12 @@ def _request_modelscope(payload: Dict[str, Any]) -> Dict[str, Any]:
             if status in {"FAILED", "CANCELED", "CANCELLED"}:
                 logger.error("ModelScope task failed: task_id=%s detail=%s", task_id, _safe_preview(task_data))
                 raise HTTPException(status_code=502, detail=task_data)
-            time.sleep(1)
+            
+            # 超过1分钟后增加轮询间隔到15秒
+            if time.time() - start_time > 60:
+                polling_interval = 15
+            
+            time.sleep(polling_interval)
 
         raise HTTPException(status_code=504, detail="ModelScope task polling timed out")
 
@@ -304,6 +311,37 @@ def _build_model_item(model_id: str, owned_by: str) -> Dict[str, Any]:
     }
 
 
+def _get_form_str(form, key: str) -> Optional[str]:
+    val = form.get(key)
+    return val if isinstance(val, str) else None
+
+
+def _extract_images(
+    data: Dict[str, Any],
+    response_format: str,
+    request_id: str,
+) -> List[Dict[str, Any]]:
+    images: List[Dict[str, Any]] = []
+    for item in data.get("images", []):
+        url = item.get("url") if isinstance(item, dict) else None
+        b64 = item.get("b64_json") if isinstance(item, dict) else None
+        if response_format == "b64_json" and not b64 and url:
+            try:
+                b64 = _download_image_as_b64(url)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Download image failed: {e}")
+        if response_format == "b64_json":
+            if b64:
+                preview = f"{b64[:80]}...{b64[-20:]}" if len(b64) > 100 else b64
+                logger.info("[%s] extracted b64_json preview: %s (total %d chars)", request_id, preview, len(b64))
+                images.append({"b64_json": b64})
+        else:
+            if url:
+                logger.info("[%s] image url=%s", request_id, url)
+                images.append({"url": url})
+    return images
+
+
 @app.post("/v1/images/generations")
 async def create_image(
     request: ImageGenerationRequest,
@@ -366,46 +404,18 @@ async def create_image(
     if provider == "modelscope":
         payload["n"] = n
         payload["size"] = size
-
         data = _request_modelscope(payload)
         logger.info("[%s] modelscope response keys=%s", request_id, sorted(data.keys()))
-        for item in data.get("images", []):
-            url = item.get("url") if isinstance(item, dict) else None
-            b64 = item.get("b64_json") if isinstance(item, dict) else None
-            if response_format == "b64_json" and not b64 and url:
-                try:
-                    b64 = _download_image_as_b64(url)
-                except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"Download image failed: {e}")
-            if response_format == "b64_json":
-                if b64:
-                    images.append({"b64_json": b64})
-            else:
-                if url:
-                    logger.info("[%s] modelscope image url=%s", request_id, url)
-                    images.append({"url": url})
+        images = _extract_images(data, response_format, request_id)
 
     elif provider == "siliconflow":
         payload["image_size"] = size
         payload["batch_size"] = n
         payload.pop("size", None)
         payload.pop("n", None)
-
         data = _request_siliconflow(payload)
         logger.info("[%s] siliconflow response keys=%s", request_id, sorted(data.keys()))
-        for item in data.get("images", []):
-            url = item.get("url") if isinstance(item, dict) else None
-            if not url:
-                continue
-            if response_format == "b64_json":
-                try:
-                    b64 = _download_image_as_b64(url)
-                    images.append({"b64_json": b64})
-                except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"Download image failed: {e}")
-            else:
-                logger.info("[%s] siliconflow image url=%s", request_id, url)
-                images.append({"url": url})
+        images = _extract_images(data, response_format, request_id)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
 
@@ -414,6 +424,163 @@ async def create_image(
         raise HTTPException(status_code=502, detail="No images found in provider response")
 
     logger.info("[%s] success image_count=%s", request_id, len(images))
+    return _as_openai_response(images)
+
+
+@app.post("/v1/images/edits")
+async def create_image_edit(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    request_id = str(uuid.uuid4())[:8]
+    logger.info("[%s] /v1/images/edits request received", request_id)
+    _check_auth(authorization)
+
+    if config is None:
+        raise HTTPException(status_code=500, detail="Configuration not initialized")
+
+    content_type = request.headers.get("content-type", "").lower()
+    logger.info("[%s] edit content-type=%s", request_id, content_type)
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        form_keys = list(form.keys())
+        logger.info("[%s] edit multipart form keys=%s", request_id, form_keys)
+
+        requested_model = _get_form_str(form, "model")
+        logger.info("[%s] edit multipart model=%s", request_id, requested_model)
+
+        prompt = _get_form_str(form, "prompt")
+        if not prompt:
+            logger.warning("[%s] edit validation failed: prompt is missing", request_id)
+            raise HTTPException(status_code=400, detail="prompt is required")
+        provider = _get_form_str(form, "provider")
+        size = _get_form_str(form, "size") or config.DEFAULT_SIZE
+        n_str = _get_form_str(form, "n")
+        n = int(n_str) if n_str else config.DEFAULT_N
+        response_format = _get_form_str(form, "response_format") or config.DEFAULT_RESPONSE_FORMAT
+
+        # 兼容 OpenAI 标准的 image[] 和常规的 image 字段名
+        image_file = form.get("image") or form.get("image[]")
+        logger.info("[%s] edit multipart image field type=%s has_read=%s", request_id, type(image_file).__name__, hasattr(image_file, "read"))
+        if image_file is None or not hasattr(image_file, "read"):
+            logger.warning("[%s] edit validation failed: image is not a file upload", request_id)
+            raise HTTPException(status_code=400, detail="image is required (file upload)")
+        image_bytes = await image_file.read()
+        if not image_bytes:
+            logger.warning("[%s] edit validation failed: image file is empty", request_id)
+            raise HTTPException(status_code=400, detail="image file is empty")
+        img_ct = getattr(image_file, "content_type", None) or "image/png"
+        image_value = f"data:{img_ct};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        logger.info("[%s] edit multipart image processed: content_type=%s size=%d bytes", request_id, img_ct, len(image_bytes))
+
+        mask_value = None
+        mask_file = form.get("mask") or form.get("mask[]")
+        if mask_file is not None and hasattr(mask_file, "read"):
+            mask_bytes = await mask_file.read()
+            if mask_bytes:
+                mask_ct = getattr(mask_file, "content_type", None) or "image/png"
+                mask_value = f"data:{mask_ct};base64,{base64.b64encode(mask_bytes).decode('ascii')}"
+                logger.info("[%s] edit multipart mask processed: content_type=%s size=%d bytes", request_id, mask_ct, len(mask_bytes))
+
+        extra_payload: Dict[str, Any] = {}
+    else:
+        body = await request.json()
+        body_preview = {k: v if k not in ("image", "mask") else f"<{type(v).__name__}:{len(str(v))} chars>" for k, v in body.items()}
+        logger.info("[%s] edit json body keys=%s preview=%s", request_id, sorted(body.keys()), body_preview)
+
+        requested_model = body.get("model")
+        prompt = body.get("prompt")
+        if not prompt:
+            logger.warning("[%s] edit validation failed: prompt is missing", request_id)
+            raise HTTPException(status_code=400, detail="prompt is required")
+        provider = body.get("provider")
+        size = body.get("size") or config.DEFAULT_SIZE
+        n = int(body.get("n", config.DEFAULT_N))
+        response_format = body.get("response_format") or config.DEFAULT_RESPONSE_FORMAT
+        image_value = body.get("image")
+        if not image_value or not isinstance(image_value, str):
+            logger.warning("[%s] edit validation failed: image is missing or not a string, type=%s", request_id, type(image_value).__name__)
+            raise HTTPException(status_code=400, detail="image is required (base64 or URL)")
+        mask_value = body.get("mask")
+
+        extra_payload = {
+            k: v for k, v in body.items()
+            if k not in {"model", "prompt", "image", "mask", "size", "n", "response_format", "provider", "user"}
+        }
+
+    if not requested_model:
+        logger.warning("[%s] edit validation failed: model is missing", request_id)
+        raise HTTPException(status_code=400, detail="model is required")
+    if n < 1:
+        logger.warning("[%s] edit validation failed: n=%s is invalid", request_id, n)
+        raise HTTPException(status_code=400, detail="n must be >= 1")
+    if response_format not in config.SUPPORTED_RESPONSE_FORMATS:
+        logger.warning("[%s] edit validation failed: unsupported response_format=%s", request_id, response_format)
+        raise HTTPException(status_code=400, detail=f"Unsupported response_format: {response_format}")
+
+    logger.info(
+        "[%s] edit resolving model: requested_model=%s provider=%s",
+        request_id, requested_model, provider,
+    )
+    try:
+        resolved_provider, resolved_model = config.resolve_model(
+            requested_model=requested_model,
+            user_provider=provider,
+        )
+    except ValueError as e:
+        logger.warning("[%s] edit model resolution failed: %s", request_id, e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    logger.info(
+        "[%s] edit resolved provider=%s requested_model=%s provider_model=%s size=%s n=%s response_format=%s",
+        request_id, resolved_provider, requested_model, resolved_model, size, n, response_format,
+    )
+
+    payload: Dict[str, Any] = {
+        "model": resolved_model,
+        "prompt": prompt,
+        "image": image_value,
+        **extra_payload,
+    }
+    if mask_value:
+        payload["mask"] = mask_value
+
+    logger.info("[%s] edit upstream payload keys=%s", request_id, sorted(payload.keys()))
+
+    images: List[Dict[str, Any]] = []
+
+    if resolved_provider == "modelscope":
+        payload["n"] = n
+        payload["size"] = size
+        # ModelScope AIGC API 使用 image_url 而非 image
+        if "image" in payload:
+            payload["image_url"] = payload.pop("image")
+        if "mask" in payload:
+            payload.pop("mask", None)  # ModelScope 不支持 mask
+        data = _request_modelscope(payload)
+        logger.info("[%s] modelscope edit response keys=%s", request_id, sorted(data.keys()))
+        images = _extract_images(data, response_format, request_id)
+
+    elif resolved_provider == "siliconflow":
+        payload["image_size"] = size
+        payload["batch_size"] = n
+        payload.pop("size", None)
+        payload.pop("n", None)
+        # SiliconFlow 支持 image, image2, image3，mask 被忽略
+        if "mask" in payload:
+            payload.pop("mask", None)
+        data = _request_siliconflow(payload)
+        logger.info("[%s] siliconflow edit response keys=%s", request_id, sorted(data.keys()))
+        images = _extract_images(data, response_format, request_id)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported provider: {resolved_provider}")
+
+    if not images:
+        logger.error("[%s] no images extracted from edit provider response", request_id)
+        raise HTTPException(status_code=502, detail="No images found in provider response")
+
+    logger.info("[%s] edit success image_count=%s", request_id, len(images))
     return _as_openai_response(images)
 
 
