@@ -1,0 +1,59 @@
+# OpenAI 兼容层的 API 密钥认证
+api_keys: ["your_openai_compatible_api_key"]
+
+providers:
+  modelscope:
+    enabled: true
+    base_url: "https://api-inference.modelscope.cn/v1"
+    api_key: "your_modelscope_access_token"
+    async_mode: false
+    task_type: "image_generation"
+    aliases:
+      Qwen/Qwen-Image:
+        alias: "Qwen Image"
+        priority: 20
+      Qwen/Qwen-Image-Edit:
+        alias: "Qwen Image Edit"
+        priority: 20
+
+  siliconflow:
+    enabled: true
+    base_url: "https://api.siliconflow.cn/v1"
+    api_key: "your_siliconflow_api_key"
+    aliases:
+      Qwen/Qwen-Image-Edit-2509:
+        alias: "Qwen Image"
+        priority: 10
+      Kwai-Kolors/Kolors:
+        alias: "Kolors"
+        priority: 20
+
+defaults:
+  size: "1024x1024"
+  n: 1
+  response_format: "b64_json"
+
+network:
+  timeout_seconds: 120
+
+supported:
+  response_formats: ["url", "b64_json"]
+  sizes:
+    - "1024x1024"
+    - "960x1280"
+    - "768x1024"
+    - "720x1280"
+    - "1328x1328"
+    - "1664x928"
+    - "928x1664"
+
+  # 静态模型列表（用于 /v1/models 聚合展示）
+  # SiliconFlow 会优先尝试在线拉取 /models?type=text-to-image；
+  # ModelScope 当前建议通过静态列表维护你实际可用的图像模型。
+  static_models:
+    modelscope:
+      - "Qwen/Qwen-Image"
+      - "Qwen/Qwen-Image-Edit"
+      - "Qwen/Qwen-Image-Edit-2509"
+    siliconflow:
+      - "Kwai-Kolors/Kolors"
