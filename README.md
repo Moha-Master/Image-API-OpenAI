@@ -1,33 +1,31 @@
 # Image API OpenAI Proxy
 
-这个项目提供一个 Python + Uvicorn 的代理服务，将 ModelScope 和 SiliconFlow 的生图接口统一转换为 OpenAI Images API 兼容格式，便于现有 OpenAI 客户端和工具直接接入。
+**完全由AI生成、人工测试，用着还行但谨慎食用。**
 
-## 目标
-
-- 统一上游：ModelScope 与 SiliconFlow
-- 统一下游：`POST /v1/images/generations`（OpenAI 兼容）
-- 对齐 `../minimax-tts-openai` 的使用方式
-  - 同样运行参数：`--dir --host --port`
-  - 同样配置方式：工作目录 + `config.yaml`
-  - 使用 `pyproject.toml`
-  - 提供入口命令：`image-api-openai`
+将 ModelScope 和 SiliconFlow 的生图接口统一转换为 OpenAI Images API 兼容格式，便于现有 OpenAI 客户端和工具直接接入。
 
 ## 安装
 
+虽然还没发布，但建议使用 pipx 作为独立程序安装
 ```bash
-pip install -e .
+pipx install image-api-openai
+```
+
+或者也可以 clone 之后本地安装：
+
+```bash
+python -m venv venv
+venv/bin/pip install -e .
 ```
 
 ## 配置
 
-1. 选择工作目录（默认 `~/.config/image-api-openai/`）
+1. 选择工作目录（默认会创建和使用 `~/.config/image-api-openai/`）
 2. 将包内的 `config.yaml.example` 复制为工作目录下 `config.yaml`
 3. 编辑 `config.yaml`，填写：
    - `providers.modelscope.api_key`
    - `providers.siliconflow.api_key`
-    - `api_keys`（你自己的 OpenAI 兼容鉴权 key）
-
-建议将 `defaults.response_format` 设为 `b64_json`（对 Open WebUI 兼容性更好）。
+    - `api_keys`（其他程序访问本接口使用的鉴权 key）
 
 ## 运行
 
@@ -36,7 +34,7 @@ image-api-openai --dir ~/.config/image-api-openai --host 0.0.0.0 --port 8000
 ```
 
 参数说明：
-- `--dir`: 工作目录，读取 `config.yaml`
+- `--dir`: 工作目录，读取 `config.yaml`，不指定时使用 ` ~/.config/image-api-openai`
 - `--host`: 监听地址
 - `--port`: 监听端口
 
@@ -63,7 +61,7 @@ curl --request POST \
 }'
 ```
 
-响应格式（OpenAI 风格）：
+响应格式：
 
 ```json
 {
@@ -83,11 +81,9 @@ curl --request POST \
 - 别名：`Qwen Image`（按优先级选择对应供应商模型）
 - 原始模型名 + `provider` 参数：`model: "Qwen/Qwen-Image", provider: "modelscope"`
 
-**注意**：`model` 为必填参数。若未使用前缀或别名，且未提供 `provider`，将返回 400 错误。
+**注意**：`model` 为必填参数。若未使用前缀或别名，将返回 400 错误。
 
 当 `response_format=b64_json` 时，代理会下载图片并回传 base64。
-
-说明：OpenAI Images API 同时支持 `url` 与 `b64_json`。但在 Open WebUI 等客户端场景，`b64_json` 通常更稳定，可避免 URL 过期、鉴权头差异、对象存储防盗链等问题。
 
 ### 查看上游提供方状态
 
@@ -157,5 +153,5 @@ providers:
 
 ## 说明
 
-- ModelScope 对部分模型可能使用异步任务；配置 `providers.modelscope.async_mode: true` 时，代理会自动轮询任务结果。
-- SiliconFlow 图片 URL 有有效期，建议调用方及时下载持久化。
+- ModelScope 目前来看对 AIGC 使用异步任务，建议打开 `providers.modelscope.async_mode: true` ，让程序自动轮询任务结果。后续直接让AI把这个设置删了，毕竟好像ModelScope全部是异步执行。
+- SiliconFlow 图片 URL 存在有效期，建议调用方及时下载持久化。
