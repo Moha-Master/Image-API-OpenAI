@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "image_api_openai"
-version = "0.1.0"
+version = "0.0.1"
 authors = [
     {name = "Moha-Master", email = "hongkongreporter@outlook.com"},
 ]

@@ -1,0 +1,44 @@
+name: Release to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 用于创建GitHub Release
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine setuptools wheel
+
+    - name: Build package
+      run: python -m build
+
+    - name: Create GitHub Release
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: "dist/*"
+        token: ${{ secrets.GITHUB_TOKEN }}
+        generateReleaseNotes: true
+
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        TWINE_REPOSITORY_URL: https://upload.pypi.org/legacy/
+      run: |
+        twine upload --verbose dist/*
